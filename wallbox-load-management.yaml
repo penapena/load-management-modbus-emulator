@@ -1,0 +1,743 @@
+esphome:
+  name: wallbox-load-management
+  friendly_name: Wallbox load management
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid2
+  password: !secret wifi_password2
+  ap:
+    ssid: "Wallbox-load-management-fallback"
+    password: !secret fallback_password
+
+api:
+  encryption:
+    key: !secret encryption_key
+  reboot_timeout: 
+    minutes: 10
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: WARN
+  baud_rate: 0
+
+debug:
+
+uart:
+  id: uart_bus
+  tx_pin: GPIO16  # Physical pin D6
+  rx_pin: GPIO17  # Physical pin D7
+  baud_rate: 9600
+  stop_bits: 1
+  rx_buffer_size: 2048
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+globals:
+  - id: last_read_time_str
+    type: std::string
+    initial_value: '"Never"'
+
+# Native Modbus Server Hub
+modbus:
+  id: modbus_hub
+  uart_id: uart_bus
+  role: server
+
+# EM340 Meter Emulation Logic (Full Data Set with Safety Guards)
+modbus_controller:
+  - id: wallbox_server
+    modbus_id: modbus_hub
+    address: 1
+    command_throttle: 50ms 
+    server_registers:
+      
+      # --- VOLTAGES (Updating Polls here!) ---
+      - address: 0x0000 
+        value_type: S_DWORD
+        read_lambda: |-
+          float current_polls = id(modbus_polls).state;
+          if (std::isnan(current_polls)) {
+            current_polls = 0;
+          }
+          id(modbus_polls).publish_state(current_polls + 1);
+
+          id(wallbox_comm_status).publish_state(true);
+
+          char buf[32];
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            now.strftime(buf, sizeof(buf), "%H:%M:%S");
+            id(last_read_time_str) = buf;
+          }
+          
+          return std::isnan(id(ha_l1_voltage).state) ? 2300 : (int32_t)(id(ha_l1_voltage).state * 10);
+      - { address: 0x0002, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l2_voltage).state * 10);" }
+      - { address: 0x0004, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l3_voltage).state * 10);" }
+      
+        # --- Phase-to-Phase Voltages (V * 10) ---
+      - address: 0x0006 # L1-L2
+        value_type: S_DWORD
+        read_lambda: |-
+          float l1 = id(ha_l1_voltage).state;
+          float l2 = id(ha_l2_voltage).state;
+          if (std::isnan(l1) || std::isnan(l2)) return 4000;
+          return (int32_t)((l1 + l2) / 2.0 * 1.732 * 10.0);
+
+      - address: 0x0008 # L2-L3
+        value_type: S_DWORD
+        read_lambda: |-
+          float l2 = id(ha_l2_voltage).state;
+          float l3 = id(ha_l3_voltage).state;
+          if (std::isnan(l2) || std::isnan(l3)) return 4000;
+          return (int32_t)((l2 + l3) / 2.0 * 1.732 * 10.0);
+
+      - address: 0x000A # L3-L1
+        value_type: S_DWORD
+        read_lambda: |-
+          float l3 = id(ha_l3_voltage).state;
+          float l1 = id(ha_l1_voltage).state;
+          if (std::isnan(l3) || std::isnan(l1)) return 4000;
+          return (int32_t)((l3 + l1) / 2.0 * 1.732 * 10.0);
+ 
+       # --- AMPERES (A * 1000) ---
+      - { address: 0x000C, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l1_current).state * 1000);" }
+      - { address: 0x000E, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l2_current).state * 1000);" }
+      - { address: 0x0010, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l3_current).state * 1000);" }         
+      
+      # --- WATTAGE (Input kW -> Spec is W * 10) ---
+      - { address: 0x0012, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l1_power).state * 10000);" }
+      - { address: 0x0014, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l2_power).state * 10000);" }
+      - { address: 0x0016, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l3_power).state * 10000);" }
+      
+      # --- APPARENT POWER (VA * 10) ---
+      - address: 0x0018 # VA L1
+        value_type: S_DWORD
+        read_lambda: |-
+          float w_val = id(ha_l1_power).state * 1000.0f;
+          float var_val = (id(ha_l1_reactive_import).state - id(ha_l1_reactive_export).state) * 1000.0f;
+          return (int32_t)(sqrt(pow(w_val, 2) + pow(var_val, 2)) * 10.0f);
+      - address: 0x001A # VA L2
+        value_type: S_DWORD
+        read_lambda: |-
+          float w_val = id(ha_l2_power).state * 1000.0f;
+          float var_val = (id(ha_l2_reactive_import).state - id(ha_l2_reactive_export).state) * 1000.0f;
+          return (int32_t)(sqrt(pow(w_val, 2) + pow(var_val, 2)) * 10.0f);
+      - address: 0x001C # VA L3
+        value_type: S_DWORD
+        read_lambda: |-
+          float w_val = id(ha_l3_power).state * 1000.0f;
+          float var_val = (id(ha_l3_reactive_import).state - id(ha_l3_reactive_export).state) * 1000.0f;
+          return (int32_t)(sqrt(pow(w_val, 2) + pow(var_val, 2)) * 10.0f);  
+      
+      # --- REACTIVE POWER (var * 10) ---
+      - { address: 0x001E, value_type: S_DWORD, read_lambda: "return (int32_t)((id(ha_l1_reactive_import).state - id(ha_l1_reactive_export).state) * 10000.0f);" }
+      - { address: 0x0020, value_type: S_DWORD, read_lambda: "return (int32_t)((id(ha_l2_reactive_import).state - id(ha_l2_reactive_export).state) * 10000.0f);" }
+      - { address: 0x0022, value_type: S_DWORD, read_lambda: "return (int32_t)((id(ha_l3_reactive_import).state - id(ha_l3_reactive_export).state) * 10000.0f);" }   
+      
+      # --- V L-N sys (Volt * 10) ---
+      - address: 0x0024 # V L-N sys
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)(((id(ha_l1_voltage).state + id(ha_l2_voltage).state + id(ha_l3_voltage).state)/3.0f) * 10.0f);"
+
+      # --- SYSTEM VOLTAGE LINE-TO-LINE (V * 10) ---
+      - address: 0x0026
+        value_type: S_DWORD
+        read_lambda: |-
+          float l1 = id(ha_l1_voltage).state;
+          float l2 = id(ha_l2_voltage).state;
+          float l3 = id(ha_l3_voltage).state;
+          
+          // Safety check for NaN
+          if (std::isnan(l1) || std::isnan(l2) || std::isnan(l3)) return 4000;
+          
+          // Calculate average L-N then convert to L-L
+          float avg_ln = (l1 + l2 + l3) / 3.0f;
+          float v_ll = avg_ln * 1.73205f;
+          
+          return (int32_t)(v_ll * 10.0f);
+
+      # --- SYSTEM (* 10) ---
+      - address: 0x0028 # W sys
+        value_type: S_DWORD
+        read_lambda: |-
+          float val_sys = id(ha_total_power).state;
+          if (std::isnan(val_sys)) return 0;
+          return (int32_t)(val_sys * 10000.0f);
+      - address: 0x002A # VA sys
+        value_type: S_DWORD
+        read_lambda: |-
+          float w_val = id(ha_total_power).state * 1000.0f;
+          float var_val = (id(ha_total_reactive_import).state - id(ha_total_reactive_export).state) * 1000.0f;
+          return (int32_t)(sqrt(pow(w_val, 2) + pow(var_val, 2)) * 10.0f);
+      - { address: 0x002C, value_type: S_DWORD, read_lambda: "return (int32_t)((id(ha_total_reactive_import).state - id(ha_total_reactive_export).state) * 10000.0f);" }
+
+      # --- CALCULATED POWER FACTOR (PF * 1000) ---
+      - address: 0x002E # PF L1
+        value_type: S_WORD
+        read_lambda: |-
+          float kw = id(ha_l1_power).state; // Real power (Net Import-Export from HA)
+          float kvar = id(ha_l1_reactive_import).state - id(ha_l1_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000; 
+          float pf = (kw / kva) * 1000.0;
+          return (int16_t)clamp(pf, -1000.0f, 1000.0f);
+
+      - address: 0x002F # PF L2
+        value_type: S_WORD
+        read_lambda: |-
+          float kw = id(ha_l2_power).state;
+          float kvar = id(ha_l2_reactive_import).state - id(ha_l2_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000;
+          float pf = (kw / kva) * 1000.0;
+          return (int16_t)clamp(pf, -1000.0f, 1000.0f);
+
+      - address: 0x0030 # PF L3
+        value_type: S_WORD
+        read_lambda: |-
+          float kw = id(ha_l3_power).state;
+          float kvar = id(ha_l3_reactive_import).state - id(ha_l3_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000;
+          float pf = (kw / kva) * 1000.0;
+          return (int16_t)clamp(pf, -1000.0f, 1000.0f);
+
+      - address: 0x0031 # Total System Power Factor
+        value_type: S_WORD
+        read_lambda: |-
+          float kw = id(ha_total_power).state; 
+          float kvar = id(ha_total_reactive_import).state - id(ha_total_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000; 
+          return (int16_t)clamp((kw / kva) * 1000.0f, -1000.0f, 1000.0f);
+      
+      # --- PHASE SEQUENCE & FREQUENCY ---
+      - { address: 0x0032, value_type: S_WORD, read_lambda: "return 0;" }    # Sequence L1-L2-L3 (0)
+      - { address: 0x0033, value_type: S_WORD, read_lambda: "return 500;" }  # 50.0 Hz
+
+      # --- ENERGY (kWh * 10) ---
+      - { address: 0x0034, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_total_energy).state * 10);" }
+
+      # --- TOTAL REACTIVE IMPORT (kvarh * 10) ---
+      - address: 0x0036
+        value_type: S_DWORD
+        read_lambda: |-
+          if (std::isnan(id(ha_total_reactive_energy_import).state)) return 0;
+          return (int32_t)(id(ha_total_reactive_energy_import).state * 10.0f);
+
+      # --- DEMAND POWER (W * 10) ---
+      - address: 0x0038 # Current Demand
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)(id(ha_total_power).state * 10000.0f);"
+
+      # --- PEAK DEMAND POWER (W * 10) ---
+      - address: 0x003A # Peak Demand (Mirroring current for now)
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)(id(ha_total_power).state * 10000.0f);"   
+
+      # --- TOTAL EXPORTED ENERGY (kWh * 10) ---
+      - address: 0x004E
+        value_type: S_DWORD
+        read_lambda: |-
+          if (std::isnan(id(ha_total_export).state)) return 0;
+          return (int32_t)(id(ha_total_export).state * 10);
+
+       # --- TOTAL REACTIVE EXPORT (kvarh- TOT) ---
+      - address: 0x0050
+        value_type: S_DWORD
+        read_lambda: |-
+          if (std::isnan(id(ha_total_reactive_energy_export).state)) return 0;
+          return (int32_t)(id(ha_total_reactive_energy_export).state * 10.0f);
+
+      # --- HI-RES ENERGY (kWh Split) ---
+      - address: 0x0400 # kWh (+) TOT Integer
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)(floor(id(ha_total_energy).state));"
+      - address: 0x0402 # kWh (+) TOT Decimal
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)((id(ha_total_energy).state - floor(id(ha_total_energy).state)) * 1000.0f);"
+
+      # --- HIGH-RES REACTIVE IMPORT (kvarh +) ---
+      - address: 0x0404 # Integer Part
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)(floor(id(ha_total_reactive_energy_import).state));"
+      - address: 0x0406 # Decimal Part
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)((id(ha_total_reactive_energy_import).state - floor(id(ha_total_reactive_energy_import).state)) * 1000.0f);"
+
+      # --- HIGH-RES ACTIVE EXPORT (kWh -) ---
+      - address: 0x0408 # Integer Part
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)(floor(id(ha_total_export).state));"
+      - address: 0x040A # Decimal Part
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)((id(ha_total_export).state - floor(id(ha_total_export).state)) * 1000.0f);"
+
+      # --- HIGH-RES REACTIVE EXPORT (kvarh -) ---
+      - address: 0x040C # Integer Part
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)(floor(id(ha_total_reactive_energy_export).state));"
+      - address: 0x040E # Decimal Part
+        value_type: S_DWORD
+        read_lambda: "return (int32_t)((id(ha_total_reactive_energy_export).state - floor(id(ha_total_reactive_energy_export).state)) * 1000.0f);"
+
+      # --- System Variables (Grouped) ---
+      - address: 0x0102
+        value_type: S_DWORD
+        read_lambda: |-
+          float l1 = id(ha_l1_voltage).state;
+          float l2 = id(ha_l2_voltage).state;
+          float l3 = id(ha_l3_voltage).state;
+          if (std::isnan(l1) || std::isnan(l2) || std::isnan(l3)) return 2300; // Fail-safe default
+          return (int32_t)(((l1 + l2 + l3) / 3.0f) * 10.0f);
+
+      # --- [0x0104] System Line-to-Line Voltage (V * 10) ---
+      - address: 0x0104
+        value_type: S_DWORD
+        read_lambda: |-
+          float l1 = id(ha_l1_voltage).state;
+          float l2 = id(ha_l2_voltage).state;
+          float l3 = id(ha_l3_voltage).state;
+          if (std::isnan(l1) || std::isnan(l2) || std::isnan(l3)) return 4000;
+          float avg_ln = (l1 + l2 + l3) / 3.0f;
+          return (int32_t)(avg_ln * 1.73205f * 10.0f);
+      - { address: 0x0106, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_total_power).state * 10000);" } # W sys
+      - address: 0x0108
+        value_type: S_DWORD
+        read_lambda: |-
+          float w_val = id(ha_total_power).state * 1000.0f; 
+          float var_val = (id(ha_total_reactive_import).state - id(ha_total_reactive_export).state) * 1000.0f; 
+          return (int32_t)(sqrt(pow(w_val,2) + pow(var_val,2)) * 10.0f);
+      - address: 0x010A
+        value_type: S_DWORD
+        read_lambda: |-
+          return (int32_t)((id(ha_total_reactive_import).state - id(ha_total_reactive_export).state) * 10000.0f);
+      - address: 0x010C # PF sys (Grouped Table)
+        value_type: S_DWORD 
+        read_lambda: |-
+          float kw = id(ha_total_power).state;
+          float kvar = id(ha_total_reactive_import).state - id(ha_total_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000;
+          return (int32_t)clamp((kw / kva) * 1000.0f, -1000.0f, 1000.0f);
+      - { address: 0x010E, value_type: S_DWORD, read_lambda: "return 0;" } # Phase sequence (0 = L1-L2-L3)
+      - { address: 0x0110, value_type: S_DWORD, read_lambda: "return 500;" } # Hz * 10
+
+      # --- HZ (Hz * 10) - Alternate Address ---
+      - address: 0x0110
+        value_type: S_DWORD # Note: This table says INT32 for Hz here, unlike 0x0033
+        read_lambda: "return 500;"
+
+      # --- Total Energies ---
+      - { address: 0x0112, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_total_energy).state * 10);" } # kWh+
+      - { address: 0x0114, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_total_reactive_energy_import).state * 10);" } # kvarh+
+      - { address: 0x0116, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_total_export).state * 10);" } # kWh-
+      - { address: 0x0118, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_total_reactive_energy_export).state * 10);" } # kvarh-
+
+      # --- Phase 1 Variables ---
+      - { address: 0x0120, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l1_voltage).state * 10);" }
+      - { address: 0x0122, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l1_current).state * 1000);" }
+      - { address: 0x0124, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l1_power).state * 10000);" }
+      - address: 0x012A
+        value_type: S_DWORD
+        read_lambda: |-
+          float kw = id(ha_l1_power).state; 
+          float kvar = id(ha_l1_reactive_import).state - id(ha_l1_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000;
+          return (int32_t)clamp((kw / kva) * 1000.0f, -1000.0f, 1000.0f);
+
+      # --- Phase 2 Variables ---
+      - { address: 0x012E, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l2_voltage).state * 10);" }
+      - { address: 0x0130, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l2_current).state * 1000);" }
+      - { address: 0x0132, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l2_power).state * 10000);" }
+      - address: 0x0138
+        value_type: S_DWORD
+        read_lambda: |-
+          float kw = id(ha_l2_power).state;
+          float kvar = id(ha_l2_reactive_import).state - id(ha_l2_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000;
+          return (int32_t)clamp((kw / kva) * 1000.0f, -1000.0f, 1000.0f);
+
+      # --- Phase 3 Variables ---
+      - { address: 0x013C, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l3_voltage).state * 10);" }
+      - { address: 0x013E, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l3_current).state * 1000);" }
+      - { address: 0x0140, value_type: S_DWORD, read_lambda: "return (int32_t)(id(ha_l3_power).state * 10000);" }
+      - address: 0x0146
+        value_type: S_DWORD
+        read_lambda: |-
+          float kw = id(ha_l3_power).state;
+          float kvar = id(ha_l3_reactive_import).state - id(ha_l3_reactive_export).state;
+          float kva = sqrt(pow(kw, 2) + pow(kvar, 2));
+          if (kva < 0.01f) return 1000;
+          return (int32_t)clamp((kw / kva) * 1000.0f, -1000.0f, 1000.0f);
+
+      # --- Firmware Version and Revision ---
+      - { address: 0x0302, value_type: U_WORD, read_lambda: "return 1;" } # Version "B"
+      - { address: 0x0303, value_type: U_WORD, read_lambda: "return 2;" } # Revision "2"
+
+      # --- IDENTIFICATION ---
+      - { address: 0x000B, value_type: U_WORD, read_lambda: "return 341;" } 
+      
+      # --- SYSTEM CONFIG ---
+      - { address: 0x1002, value_type: U_WORD, read_lambda: "return 0;" }    # 3Pn
+      
+      # --- Current Transformer Ratio (Value 10 = 1.0) ---
+      - address: 0x1003
+        value_type: U_DWORD # UINT32 as per Table 2.9-3
+        read_lambda: "return 10;"
+        write_lambda: "return true;" # Accept writes but don't change anything
+
+      # --- Voltage Transformer Ratio (Value 10 = 1.0) ---
+      - address: 0x1005
+        value_type: U_DWORD
+        read_lambda: "return 10;"
+        write_lambda: "return true;"      
+      
+      # --- Integration time for dmd power (Default 15 min) ---
+      - address: 0x1010
+        value_type: U_DWORD
+        read_lambda: "return 15;"
+        write_lambda: "return true;"
+
+      # --- Ton time for pulse output (Default 0 = 30ms) ---
+      - address: 0x1012
+        value_type: U_DWORD
+        read_lambda: "return 0;"
+        write_lambda: "return true;"
+
+      # --- kWh per pulse Out 1 (Default 1000 = 1 pulse/kWh) ---
+      - address: 0x1020
+        value_type: U_DWORD
+        read_lambda: "return 1000;"
+        write_lambda: "return true;"
+
+      # --- kWh per pulse Out 2 (Default 1000) ---
+      - address: 0x1022
+        value_type: U_DWORD
+        read_lambda: "return 1000;"
+        write_lambda: "return true;"      
+      
+      # --- Display Mode (0 = Full, Default) ---
+      - address: 0x1100
+        value_type: U_WORD
+        read_lambda: "return 0;"
+        write_lambda: "return true;"
+
+      # --- Tariff Management Enabling (0 = OFF, Default) ---
+      - address: 0x1101
+        value_type: U_WORD
+        read_lambda: "return 0;"
+        write_lambda: "return true;"
+      
+      # --- MEASUREMENT & HOME PAGE ---
+      - { address: 0x1102, value_type: U_WORD, read_lambda: "return 0;" } # Home page 0
+      - { address: 0x1103, value_type: U_WORD, read_lambda: "return 1;" } # Measurement Mode B
+
+      # --- Installing Help Management (0 = ON/Enabled) ---
+      - address: 0x1104
+        value_type: U_WORD
+        read_lambda: "return 0;"
+        write_lambda: "return true;"
+
+      # --- Wiring Status (0 = All OK / No Errors) ---
+      - address: 0x1105
+        value_type: U_WORD
+        read_lambda: "return 0;" # Tell the Wallbox the wiring is perfect
+        write_lambda: "return true;"
+
+      # --- Tariff Mode Selection (1 = via serial comm) ---
+      - address: 0x1200
+        value_type: U_WORD
+        read_lambda: "return 1;"
+        write_lambda: "return true;"
+
+      # --- Active Tariff Selection (1 = Tariff 1) ---
+      - address: 0x1201
+        value_type: U_WORD
+        read_lambda: "return 1;"
+        write_lambda: "return true;"
+
+      # --- RS485 Configuration ---
+      - { address: 0x2000, value_type: U_WORD, read_lambda: "return 1;" }    # My Address is 1
+      - { address: 0x2001, value_type: U_WORD, read_lambda: "return 1;" }    # Baud rate is 9.6kbps
+      - { address: 0x2002, value_type: U_WORD, read_lambda: "return 1;" }    # Parity is None
+      - { address: 0x2003, value_type: U_WORD, read_lambda: "return 1;" }    # Stop bits (1)
+
+      # --- [0x2004] Max words readable in one request (50 words) ---
+      - address: 0x2004
+        value_type: U_WORD
+        read_lambda: "return 50;"
+
+      # --- RESET COMMANDS (0x4000 - 0x4002) ---
+      - address: 0x4000
+        value_type: U_WORD
+        read_lambda: "return 0;" 
+        write_lambda: |-
+          ESP_LOGD("modbus", "Wallbox requested Partial Meter Reset");
+          return true;
+          
+      - address: 0x4001
+        value_type: U_WORD
+        read_lambda: "return 0;"
+        write_lambda: |-
+          ESP_LOGD("modbus", "Wallbox requested Total Meter Reset");
+          return true;
+
+      - address: 0x4002 
+        value_type: U_WORD
+        read_lambda: "return 0;"
+        write_lambda: |-
+          ESP_LOGD("modbus", "Wallbox requested Run Hour Reset");
+          return true;         
+
+      # --- SERIAL NUMBER (7 ASCII Letters) ---
+      - { address: 0x5000, value_type: U_WORD, read_lambda: "return 69;" } # E
+      - { address: 0x5001, value_type: U_WORD, read_lambda: "return 83;" } # S
+      - { address: 0x5002, value_type: U_WORD, read_lambda: "return 80;" } # P
+      - { address: 0x5003, value_type: U_WORD, read_lambda: "return 45;" } # -
+      - { address: 0x5004, value_type: U_WORD, read_lambda: "return 67;" } # C
+      - { address: 0x5005, value_type: U_WORD, read_lambda: "return 54;" } # 6
+      - { address: 0x5006, value_type: U_WORD, read_lambda: "return 32;" } # [Space]
+
+      - { address: 0x5010, value_type: U_WORD, read_lambda: "return 2026;" } # Year
+
+sensor:
+# --- Energies & Reactive (Keep original names) ---
+  - platform: homeassistant
+    id: ha_total_energy
+    entity_id: sensor.cumulative_active_import
+    internal: true
+  - platform: homeassistant
+    id: ha_total_export
+    entity_id: sensor.cumulative_active_export
+    internal: true
+  - platform: homeassistant
+    id: ha_total_active_export # Retained for your specific Modbus logic 0x002A
+    entity_id: sensor.momentary_active_export
+    internal: true
+    force_update: true
+    
+# --- Phase 1: Import, Export -> Net kW (ha_l1_power) ---
+  - platform: homeassistant
+    id: ha_l1_power_imp_raw
+    entity_id: sensor.momentary_active_import_phase_1
+    internal: true
+    force_update: true
+  - platform: homeassistant
+    id: ha_l1_power_exp_raw
+    entity_id: sensor.momentary_active_export_phase_1
+    internal: true
+  - platform: template
+    id: ha_l1_power
+    force_update: true
+    lambda: |-
+      float imp = id(ha_l1_power_imp_raw).state;
+      float exp = id(ha_l1_power_exp_raw).state;
+      return (std::isnan(imp) ? 0.0f : imp) - (std::isnan(exp) ? 0.0f : exp);
+
+  # --- Phase 2: Import, Export -> Net kW (ha_l2_power) ---
+  - platform: homeassistant
+    id: ha_l2_power_imp_raw
+    entity_id: sensor.momentary_active_import_phase_2
+    internal: true
+    force_update: true
+  - platform: homeassistant
+    id: ha_l2_power_exp_raw
+    entity_id: sensor.momentary_active_export_phase_2
+    internal: true
+    force_update: true
+  - platform: template
+    id: ha_l2_power
+    lambda: |-
+      float imp = id(ha_l2_power_imp_raw).state;
+      float exp = id(ha_l2_power_exp_raw).state;
+      return (std::isnan(imp) ? 0.0f : imp) - (std::isnan(exp) ? 0.0f : exp);
+
+  # --- Phase 3: Import, Export -> Net kW (ha_l3_power) ---
+  - platform: homeassistant
+    id: ha_l3_power_imp_raw
+    entity_id: sensor.momentary_active_import_phase_3
+    internal: true
+    force_update: true
+  - platform: homeassistant
+    id: ha_l3_power_exp_raw
+    entity_id: sensor.momentary_active_export_phase_3
+    internal: true
+    force_update: true
+  - platform: template
+    id: ha_l3_power
+    lambda: |-
+      float imp = id(ha_l3_power_imp_raw).state;
+      float exp = id(ha_l3_power_exp_raw).state;
+      return (std::isnan(imp) ? 0.0f : imp) - (std::isnan(exp) ? 0.0f : exp);
+
+  # --- Total: Import, Export -> Net kW (ha_total_power) ---
+  - platform: homeassistant
+    id: ha_total_power_imp_raw
+    entity_id: sensor.momentary_active_import
+    internal: true
+    force_update: true
+  - platform: homeassistant
+    id: ha_total_power_exp_raw
+    entity_id: sensor.momentary_active_export
+    internal: true
+    force_update: true
+  - platform: template
+    id: ha_total_power
+    lambda: |-
+      float imp = id(ha_total_power_imp_raw).state;
+      float exp = id(ha_total_power_exp_raw).state;
+      return (std::isnan(imp) ? 0.0f : imp) - (std::isnan(exp) ? 0.0f : exp);
+
+  # --- Voltages (V) with Safety Filters ---
+  - platform: homeassistant
+    id: ha_l1_voltage
+    entity_id: sensor.voltage_phase_1
+    internal: true
+    filters:
+      - lambda: |-
+          return std::isnan(x) ? 230.0f : x;
+  - platform: homeassistant
+    id: ha_l2_voltage
+    entity_id: sensor.voltage_phase_2
+    internal: true
+    filters:
+      - lambda: |- 
+          return std::isnan(x) ? 230.0f : x;
+  - platform: homeassistant
+    id: ha_l3_voltage
+    entity_id: sensor.voltage_phase_3
+    internal: true
+    filters:
+      - lambda: |- 
+          return std::isnan(x) ? 230.0f : x;
+
+  # --- Currents (A) with Safety Filters ---
+  - platform: homeassistant
+    id: ha_l1_current
+    entity_id: sensor.current_phase_1
+    internal: true
+    force_update: true
+    filters:
+      - lambda: |- 
+          return std::isnan(x) ? 0.0f : x;
+  - platform: homeassistant
+    id: ha_l2_current
+    entity_id: sensor.current_phase_2
+    internal: true
+    force_update: true
+    filters:
+      - lambda: |- 
+          return std::isnan(x) ? 0.0f : x;
+  - platform: homeassistant
+    id: ha_l3_current
+    entity_id: sensor.current_phase_3
+    internal: true
+    force_update: true
+    filters:
+      - lambda: |- 
+          return std::isnan(x) ? 0.0f : x;
+
+  # kvar sensors (Used for PF and VA calculations)
+  - platform: homeassistant
+    id: ha_l1_reactive_import
+    entity_id: sensor.momentary_reactive_import_phase_1
+    internal: true
+  - platform: homeassistant
+    id: ha_l1_reactive_export
+    entity_id: sensor.momentary_reactive_export_phase_1
+    internal: true
+  - platform: homeassistant
+    id: ha_l2_reactive_import
+    entity_id: sensor.momentary_reactive_import_phase_2
+    internal: true
+  - platform: homeassistant
+    id: ha_l2_reactive_export
+    entity_id: sensor.momentary_reactive_export_phase_2
+    internal: true
+  - platform: homeassistant
+    id: ha_l3_reactive_import
+    entity_id: sensor.momentary_reactive_import_phase_3
+    internal: true
+  - platform: homeassistant
+    id: ha_l3_reactive_export
+    entity_id: sensor.momentary_reactive_export_phase_3
+    internal: true
+  - platform: homeassistant
+    id: ha_total_reactive_import
+    entity_id: sensor.momentary_reactive_import
+    internal: true
+  - platform: homeassistant
+    id: ha_total_reactive_export
+    entity_id: sensor.momentary_reactive_export
+    internal: true
+  - platform: homeassistant
+    id: ha_total_reactive_energy_import
+    entity_id: sensor.reactive_energy_imported
+    internal: true
+  - platform: homeassistant
+    id: ha_total_reactive_energy_export
+    entity_id: sensor.reactive_energy_exported
+    internal: true
+
+  # --- Diagnostic Sensors ---
+  - platform: wifi_signal
+    name: "Wallbox load management WiFi signal"
+    update_interval: 60s
+  - platform: internal_temperature
+    name: "Wallbox load management internal temperature"
+    update_interval: 60s
+  - platform: uptime
+    id: wallbox_load_management_uptime
+    name: "Wallbox load management uptime"
+    update_interval: 60s
+  - platform: template
+    name: "Wallbox Modbus Polls"
+    id: modbus_polls
+    unit_of_measurement: "polls"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:sync
+    
+text_sensor:
+  - platform: debug
+  - platform: wifi_info
+    ip_address:
+      name: "Wallbox load management IP address"
+    ssid:
+      name: "Wallbox load management connected SSID"
+
+  - platform: template
+    name: "Wallbox Last Successful Read"
+    id: last_read_display
+    icon: mdi:clock-outline
+    update_interval: 5s
+    lambda: |-
+      return id(last_read_time_str);
+
+binary_sensor:
+  - platform: template
+    name: "Wallbox Communication Status"
+    id: wallbox_comm_status
+    device_class: connectivity
+    filters:
+      - delayed_off: 60s
+
+button:
+  - platform: restart
+    name: "Wallbox load management Restart"
+
+captive_portal:
